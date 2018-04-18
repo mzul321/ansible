@@ -75,7 +75,7 @@
    when: target_war.stat.checksum != find_war_result.files.0.checksum
 
  - name: deactivate config adapters for one-leg deployment i.e sit env.
-   command: /opt/caplin/sbp deactivate {{ item }}
+   command: /opt/maplex/sbp deactivate {{ item }}
    with_items:
       - HelloOrderAdapter-config
       - CalendarAdapter-config
