@@ -1,0 +1,8 @@
+# ansible-playbook -i sit fx_service.yml --tags="stopall,startall"
+---
+- hosts: devops
+  become: true
+  become_user: mzul321
+  become_method: su
+  roles:
+    - fx_service
