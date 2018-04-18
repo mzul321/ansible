@@ -1,0 +1,181 @@
+# ansible-playbook -i sit playbooks/fxp_get_artifacts.yml --extra-vars="ver=1.11.3 build=3066" --check -vvvv
+---
+- hosts: fxrepo
+  become: true
+  become_user: fxbuild
+  become_method: su
+  tasks:
+#  - debug: msg="find_rpm_version.files.0.path"
+#  - debug: var=find_rpm_version
+
+  - name: Check if path exists
+    stat: path=/home/fxbuild/upload_area/FX.{{ ver }}
+    register: check_path
+
+  - name: Created a FX Download Folder if not exists
+    file: path=/home/fxbuild/upload_area/FX.{{ ver }} state=directory
+    when: check_path.stat.exists == false
+
+  - name: Setting download path fact
+    set_fact: download_path=/home/fxbuild/upload_area/FX.{{ ver }}
+    when: check_path.stat.exists == false
+
+  - name: FX folder exists, create another folder with new build number with same version
+    file: path=/home/fxbuild/upload_area/FX.{{ ver }}-{{ build }} state=directory
+    when: check_path.stat.exists == true
+
+  - name: setting download path fact
+    set_fact: download_path=/home/fxbuild/upload_area/FX.{{ ver }}-{{ build }}
+    when: check_path.stat.exists == true
+
+  - name: Download SBP's Director Reactor
+    get_url:
+      url: http://lnx-hello:8081/artifactory/fxapp-release/com/fxapp/director-conf/{{ ver }}-{{ build }}/director-conf-{{ ver }}-{{ build }}.zip
+      dest: "{{ download_path }}"
+
+  - name: set FXComponent JAR
+    set_fact: jar_archive={{ download_path }}/director-conf-{{ ver }}-{{ build }}.zip
+
+  - name: Unarchive the JAR file
+    unarchive:
+      src: "{{ jar_archive }}"
+      dest: "{{ download_path }}"
+#      remote_src: true
+
+  - name: show all the files as per the download path
+    find:
+      paths: "{{ download_path }}"
+      recurse: yes
+
+ - name: find all logs files greater than > 100MB and delete it
+   command: find /local/home/sbp -type f -name "*.log" -size +100M -printf "%p %TY-%Tm-%Td %TH:%TM >> %k KB\n" -exec rm -rf {} \;
+   ignore_errors: yes
+   register: logs
+
+ - name: print affected files
+   debug: var=logs.stdout_lines
+
+ - name: Stop any Apache Tomcat processes
+   command: pkill -u tomcat8 -f "tomcat" creates=/tmp/tomcat.pid
+   ignore_errors: yes
+   tags: stop_tomcat
+
+ - name:  Get fusionztrader.war.{{ ver }}-{{ build }} from fxgbuild shared folder
+   find:
+      paths: "/home/fxgbuild/upload_area"
+      patterns: "*.war.{{ ver }}-{{ build }}"
+      recurse: yes
+      file_type: file
+      get_checksum: true
+   when: ver is defined and build is defined
+   register: find_war_result
+
+ - name: Delete fusionztrader.war file only if checksum is different
+   file: path=/local/vendor/tomcat8/tomcat/webapps/fusionztrader.war state=absent
+   when: target_war.stat.checksum != find_war_result.files.0.checksum
+
+ - name: deactivate config adapters for one-leg deployment i.e sit env.
+   command: /opt/caplin/sbp deactivate {{ item }}
+   with_items:
+      - HelloOrderAdapter-config
+      - CalendarAdapter-config
+
+ - name: File exists, download should abort...
+   meta: end_play
+   when: find_rpm_version.matched >= 1
+
+ - name: Copy resources from fxgbuild into sample
+   copy: src="{{ item }}" dest="{{ fxg_app_home }}/sample/zambino-mock" mode=0644 remote_src=true
+   with_fileglob:
+      -  "/home/fxgbuild/zFX-Development/zambino-mock/target/*.properties"
+      -  "/home/fxgbuild/zFX-Development/zambino-mock/target/*.xml"
+
+ - name: Overwrite zambino-mock-master/lib into lib
+   synchronize: src={{ fxg_app_home }}/sample/zambino-mock/zambino-mock/lib/ dest={{ fxg_app_home }}/lib/zambino-mock
+   delegate_to: "{{ inventory_hostname }}"
+
+ - name: Replace Caching memberlist target
+   replace:
+     dest: "{{ fxg_app_home }}/config/zambino-mock/integration.test.properties"
+     regexp: '^mantra.sbp.caching.service.memberlist=.*'
+     replace: 'mantra.sbp.caching.service.memberlist={{ caching_host }}'
+   tags: caching
+
+ - name: Update vm settings
+   file: src={{ fxg_app_home }}/sample/vm/zambino-mock_vm.conf dest={{ fxg_app_home }}/config/vm/zambino-mock_vm.conf mode=0644
+
+ - block:
+    - name: Update zambino-mock.properties from template
+      template: src=zambino-mock.properties.template dest={{ app_home }}/config/test.fusionz.properties mode=0644
+
+   become: yes
+   become_user: mainbase
+   become_method: su
+
+ - name: Mantra Mock - Service status
+   shell: "source /local/home/mainbase/.bash_profile;cd /opt/fxg/bin;./fxgprocess show zambino-mock"
+#      args:
+#        chdir: "{{ fxg_app_home }}/bin"
+   register: status_service_out
+   tags: status
+
+ - name: Show the output of the status
+   debug: var=status_service_out.stdout_lines
+
+ - name: Mantria - Start application
+   shell: "source /local/home/mainbase/.bash_profile;nohup ./fxgprocess start mantra"
+   args:
+     chdir: "{{ mantra_app_home }}/bin"
+     register: start_service_out
+     tags: start
+
+ - name: Overwrite bash_profile to this host
+   copy: src=bash_profile dest=/local/home/mainbase/.bash_profile mode=0644
+
+ - name: remove mantra.tibco.rv.*
+   blockinfile:
+     dest: "{{ mantra_app_home }}/config/mantra/mantra.properties"
+     state: absent
+     block: |
+        #DEV3 Mantra
+        mantra.tibco.rv.service=8350
+        mantra.tibco.rv.network=;239.195.192.6
+        mantra.tibco.rv.daemon=lnx-fxgd62.ants.ad.anplc.co.uk:8350
+   when: inventory_hostname in groups['master']
+
+ - name: Replace Caching memberlist
+   replace:
+     dest: "{{ zambino_app_home }}/config/zambino/zambino.properties"
+     regexp: '^zambino.sbp.caching.service.memberlist=.*'
+     replace: 'zambino.sbp.caching.service.memberlist={{ caching_host }}'
+   tags: caching
+
+ - name: Copy default FusionzReactor<version>.jar
+   action: copy src="{{ fxgbuild_path.stdout }}/FusionzReactor-{{ ver }}-{{ build }}.jar" dest={{ tomcat_conf }}/director
+
+- name: Copy all conf default files in conf folder
+  copy: src="{{ role_path }}/files/conf/{{ item.src }}" dest={{ item.dest }}
+  with_items:
+    - { src: 'cacert', dest: '{{ tomcat_conf }}' }
+    - { src: 'web.xml', dest: '{{ tomcat_conf }}' }
+
+- name: Copy all war files into tomcat/webapps
+  copy: src="{{ role_path }}/files/war/{{ item.src }}" dest={{ item.dest }} mode=0644
+  with_items:
+    - { src: 'fusionztrader.war', dest: '{{ tomcat_webapps }}' }
+    - { src: 'director.war', dest: '{{ tomcat_webapps }}' }
+    - { src: 'ssomock.war', dest: '{{ tomcat_webapps }}' }
+#  when: md5_war.stat.md5 != '6ddff76ffe47e5649f9e3c4669e59d41'
+
+ - name: Delete default alias keystore
+   shell: echo "yes" | keytool -importcert -file "{{ inventory_hostname }}.blabla.co.uk-cert.cer" -keystore "client-keystore.jks" -storepass "storepassword" -alias "flame-{{ inventory_hostname }}.blabla.co.uk"
+   args:
+     chdir: "{{ tomcat_home }}/tomcat/conf/ssl/"
+
+
+ - name: Wait until the process is finished and pid was destroyed
+   wait_for:
+     path: /proc/{{ mantrino_pid.stdout }}/status
+     state: absent
+   tags: start
+
